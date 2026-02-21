@@ -1,8 +1,6 @@
 #include <hps/src/hps.h>
 #include <shci/src/det/det.h>
 
-#include <Eigen/Dense>
-
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -60,6 +58,50 @@ struct CIEntry {
 
 struct OrbitalComb {
   std::vector<unsigned> occ;
+};
+
+struct VecHash {
+  size_t operator()(const std::vector<unsigned>& v) const {
+    size_t seed = v.size();
+    for (unsigned x : v) {
+      seed ^= static_cast<size_t>(x) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+  }
+};
+
+struct DetKey {
+  std::vector<unsigned> up;
+  std::vector<unsigned> dn;
+
+  bool operator==(const DetKey& other) const {
+    return up == other.up && dn == other.dn;
+  }
+};
+
+struct DetKeyHash {
+  size_t operator()(const DetKey& key) const {
+    size_t seed = VecHash{}(key.up);
+    seed ^= VecHash{}(key.dn) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+  }
+};
+
+struct MinorKey {
+  size_t old_id;
+  size_t new_id;
+
+  bool operator==(const MinorKey& other) const {
+    return old_id == other.old_id && new_id == other.new_id;
+  }
+};
+
+struct MinorKeyHash {
+  size_t operator()(const MinorKey& key) const {
+    size_t seed = key.old_id;
+    seed ^= key.new_id + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+  }
 };
 
 static void usage() {
@@ -140,25 +182,52 @@ static std::vector<OrbitalComb> enumerate_combs(unsigned n, unsigned k) {
   return out;
 }
 
-static double minor_det(const std::vector<std::vector<double>>& rot,
-                        const std::vector<unsigned>& old_occ,
-                        const std::vector<unsigned>& new_occ) {
+static double minor_det_inplace(const std::vector<std::vector<double>>& rot,
+                                const std::vector<unsigned>& old_occ,
+                                const std::vector<unsigned>& new_occ,
+                                std::vector<double>& sub,
+                                std::vector<size_t>& pivots) {
   const size_t n = old_occ.size();
-  Eigen::MatrixXd sub(n, n);
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = 0; j < n; ++j) {
-      sub(i, j) = rot[old_occ[i]][new_occ[j]];
+      sub[i * n + j] = rot[old_occ[i]][new_occ[j]];
     }
   }
-  return sub.determinant();
-}
 
-static std::string occ_to_key(const std::vector<unsigned>& up, const std::vector<unsigned>& dn) {
-  std::ostringstream os;
-  for (unsigned x : up) os << x << ',';
-  os << '|';
-  for (unsigned x : dn) os << x << ',';
-  return os.str();
+  double det_sign = 1.0;
+  for (size_t k = 0; k < n; ++k) {
+    size_t pivot = k;
+    double max_abs = std::abs(sub[k * n + k]);
+    for (size_t i = k + 1; i < n; ++i) {
+      const double v = std::abs(sub[i * n + k]);
+      if (v > max_abs) {
+        max_abs = v;
+        pivot = i;
+      }
+    }
+    pivots[k] = pivot;
+    if (max_abs == 0.0) return 0.0;
+
+    if (pivot != k) {
+      for (size_t j = 0; j < n; ++j) {
+        std::swap(sub[k * n + j], sub[pivot * n + j]);
+      }
+      det_sign = -det_sign;
+    }
+
+    const double pivot_val = sub[k * n + k];
+    for (size_t i = k + 1; i < n; ++i) {
+      const double factor = sub[i * n + k] / pivot_val;
+      sub[i * n + k] = factor;
+      for (size_t j = k + 1; j < n; ++j) {
+        sub[i * n + j] -= factor * sub[k * n + j];
+      }
+    }
+  }
+
+  double det = det_sign;
+  for (size_t i = 0; i < n; ++i) det *= sub[i * n + i];
+  return det;
 }
 
 int main(int argc, char* argv[]) {
@@ -250,21 +319,55 @@ int main(int argc, char* argv[]) {
   const auto alpha_combs = enumerate_combs(n_orb, wf.n_up);
   const auto beta_combs = enumerate_combs(n_orb, wf.n_dn);
 
-  std::unordered_map<std::string, double> old_coef_map;
+  std::unordered_map<DetKey, double, DetKeyHash> old_coef_map;
   old_coef_map.reserve(alpha_combs.size() * 2);
 
+  std::unordered_map<std::vector<unsigned>, size_t, VecHash> up_occ_id_map;
+  std::unordered_map<std::vector<unsigned>, size_t, VecHash> dn_occ_id_map;
+  up_occ_id_map.reserve(ci_new.size());
+  dn_occ_id_map.reserve(ci_new.size());
+
+  std::unordered_map<MinorKey, double, MinorKeyHash> alpha_minor_cache;
+  std::unordered_map<MinorKey, double, MinorKeyHash> beta_minor_cache;
+  alpha_minor_cache.reserve(alpha_combs.size() * 4);
+  beta_minor_cache.reserve(beta_combs.size() * 4);
+
+  std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
+  std::vector<size_t> alpha_pivots(wf.n_up, 0);
+  std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
+  std::vector<size_t> beta_pivots(wf.n_dn, 0);
+
   for (const auto& e : ci_new) {
+    const auto up_insert = up_occ_id_map.emplace(e.up_occ, up_occ_id_map.size());
+    const size_t up_occ_id = up_insert.first->second;
+    const auto dn_insert = dn_occ_id_map.emplace(e.dn_occ, dn_occ_id_map.size());
+    const size_t dn_occ_id = dn_insert.first->second;
+
     std::vector<std::pair<const std::vector<unsigned>*, double>> alpha_terms;
     alpha_terms.reserve(alpha_combs.size());
-    for (const auto& occ : alpha_combs) {
-      const double a = minor_det(rot, occ.occ, e.up_occ);
+    for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
+      const auto& occ = alpha_combs[old_id];
+      const MinorKey key{old_id, up_occ_id};
+      auto it = alpha_minor_cache.find(key);
+      if (it == alpha_minor_cache.end()) {
+        const double value = minor_det_inplace(rot, occ.occ, e.up_occ, alpha_sub, alpha_pivots);
+        it = alpha_minor_cache.emplace(key, value).first;
+      }
+      const double a = it->second;
       if (std::abs(a) >= amp_cut) alpha_terms.push_back({&occ.occ, a});
     }
 
     std::vector<std::pair<const std::vector<unsigned>*, double>> beta_terms;
     beta_terms.reserve(beta_combs.size());
-    for (const auto& occ : beta_combs) {
-      const double b = minor_det(rot, occ.occ, e.dn_occ);
+    for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
+      const auto& occ = beta_combs[old_id];
+      const MinorKey key{old_id, dn_occ_id};
+      auto it = beta_minor_cache.find(key);
+      if (it == beta_minor_cache.end()) {
+        const double value = minor_det_inplace(rot, occ.occ, e.dn_occ, beta_sub, beta_pivots);
+        it = beta_minor_cache.emplace(key, value).first;
+      }
+      const double b = it->second;
       if (std::abs(b) >= amp_cut) beta_terms.push_back({&occ.occ, b});
     }
 
@@ -272,7 +375,7 @@ int main(int argc, char* argv[]) {
       for (const auto& b : beta_terms) {
         const double contrib = e.coef * a.second * b.second;
         if (std::abs(contrib) < amp_cut) continue;
-        old_coef_map[occ_to_key(*a.first, *b.first)] += contrib;
+        old_coef_map[{*a.first, *b.first}] += contrib;
       }
     }
   }
@@ -280,32 +383,7 @@ int main(int argc, char* argv[]) {
   std::vector<CIEntry> ci_old;
   ci_old.reserve(old_coef_map.size());
   for (const auto& kv : old_coef_map) {
-    std::vector<unsigned> up;
-    std::vector<unsigned> dn;
-    bool dn_part = false;
-    unsigned cur = 0;
-    bool in_num = false;
-    for (char ch : kv.first) {
-      if (ch == '|') {
-        if (in_num) {
-          up.push_back(cur);
-          cur = 0;
-          in_num = false;
-        }
-        dn_part = true;
-      } else if (ch == ',') {
-        if (in_num) {
-          if (!dn_part) up.push_back(cur);
-          else dn.push_back(cur);
-          cur = 0;
-          in_num = false;
-        }
-      } else if (ch >= '0' && ch <= '9') {
-        cur = cur * 10 + static_cast<unsigned>(ch - '0');
-        in_num = true;
-      }
-    }
-    ci_old.push_back({up, dn, kv.second});
+    ci_old.push_back({kv.first.up, kv.first.dn, kv.second});
   }
 
   std::sort(ci_old.begin(), ci_old.end(), [](const CIEntry& a, const CIEntry& b) {
