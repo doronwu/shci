@@ -12,6 +12,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 constexpr double SQRT2_INV = 0.7071067811865475;
 
 class Wavefunction {
@@ -83,23 +87,6 @@ struct DetKeyHash {
   size_t operator()(const DetKey& key) const {
     size_t seed = VecHash{}(key.up);
     seed ^= VecHash{}(key.dn) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    return seed;
-  }
-};
-
-struct MinorKey {
-  size_t old_id;
-  size_t new_id;
-
-  bool operator==(const MinorKey& other) const {
-    return old_id == other.old_id && new_id == other.new_id;
-  }
-};
-
-struct MinorKeyHash {
-  size_t operator()(const MinorKey& key) const {
-    size_t seed = key.old_id;
-    seed ^= key.new_id + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     return seed;
   }
 };
@@ -319,64 +306,149 @@ int main(int argc, char* argv[]) {
   const auto alpha_combs = enumerate_combs(n_orb, wf.n_up);
   const auto beta_combs = enumerate_combs(n_orb, wf.n_dn);
 
-  std::unordered_map<DetKey, double, DetKeyHash> old_coef_map;
-  old_coef_map.reserve(alpha_combs.size() * 2);
-
   std::unordered_map<std::vector<unsigned>, size_t, VecHash> up_occ_id_map;
   std::unordered_map<std::vector<unsigned>, size_t, VecHash> dn_occ_id_map;
   up_occ_id_map.reserve(ci_new.size());
   dn_occ_id_map.reserve(ci_new.size());
 
-  std::unordered_map<MinorKey, double, MinorKeyHash> alpha_minor_cache;
-  std::unordered_map<MinorKey, double, MinorKeyHash> beta_minor_cache;
-  alpha_minor_cache.reserve(alpha_combs.size() * 4);
-  beta_minor_cache.reserve(beta_combs.size() * 4);
+  std::vector<size_t> ci_up_ids(ci_new.size(), 0);
+  std::vector<size_t> ci_dn_ids(ci_new.size(), 0);
+  std::vector<const std::vector<unsigned>*> unique_up_occs;
+  std::vector<const std::vector<unsigned>*> unique_dn_occs;
+  unique_up_occs.reserve(ci_new.size());
+  unique_dn_occs.reserve(ci_new.size());
 
-  std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
-  std::vector<size_t> alpha_pivots(wf.n_up, 0);
-  std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
-  std::vector<size_t> beta_pivots(wf.n_dn, 0);
+  for (size_t i = 0; i < ci_new.size(); ++i) {
+    const auto& e = ci_new[i];
+    const auto up_insert = up_occ_id_map.emplace(e.up_occ, unique_up_occs.size());
+    if (up_insert.second) unique_up_occs.push_back(&up_insert.first->first);
+    ci_up_ids[i] = up_insert.first->second;
 
-  for (const auto& e : ci_new) {
-    const auto up_insert = up_occ_id_map.emplace(e.up_occ, up_occ_id_map.size());
-    const size_t up_occ_id = up_insert.first->second;
-    const auto dn_insert = dn_occ_id_map.emplace(e.dn_occ, dn_occ_id_map.size());
-    const size_t dn_occ_id = dn_insert.first->second;
+    const auto dn_insert = dn_occ_id_map.emplace(e.dn_occ, unique_dn_occs.size());
+    if (dn_insert.second) unique_dn_occs.push_back(&dn_insert.first->first);
+    ci_dn_ids[i] = dn_insert.first->second;
+  }
 
-    std::vector<std::pair<const std::vector<unsigned>*, double>> alpha_terms;
-    alpha_terms.reserve(alpha_combs.size());
-    for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
-      const auto& occ = alpha_combs[old_id];
-      const MinorKey key{old_id, up_occ_id};
-      auto it = alpha_minor_cache.find(key);
-      if (it == alpha_minor_cache.end()) {
-        const double value = minor_det_inplace(rot, occ.occ, e.up_occ, alpha_sub, alpha_pivots);
-        it = alpha_minor_cache.emplace(key, value).first;
+  std::unordered_map<DetKey, double, DetKeyHash> old_coef_map;
+  old_coef_map.reserve(alpha_combs.size() * 2);
+
+  const bool use_parallel = ci_new.size() > 1;
+  const bool has_reuse = unique_up_occs.size() < ci_new.size() || unique_dn_occs.size() < ci_new.size();
+
+  int n_threads = 1;
+#ifdef _OPENMP
+  n_threads = use_parallel ? omp_get_max_threads() : 1;
+#endif
+  std::vector<std::unordered_map<DetKey, double, DetKeyHash>> old_coef_maps_local(n_threads);
+  for (auto& m : old_coef_maps_local) m.reserve(alpha_combs.size());
+
+  if (has_reuse) {
+    std::vector<std::vector<std::pair<size_t, double>>> alpha_terms_by_new_occ(unique_up_occs.size());
+    std::vector<std::vector<std::pair<size_t, double>>> beta_terms_by_new_occ(unique_dn_occs.size());
+
+#pragma omp parallel if(use_parallel)
+    {
+      std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
+      std::vector<size_t> alpha_pivots(wf.n_up, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t new_id = 0; new_id < unique_up_occs.size(); ++new_id) {
+        auto& alpha_terms = alpha_terms_by_new_occ[new_id];
+        alpha_terms.reserve(alpha_combs.size());
+        const auto& new_occ = *unique_up_occs[new_id];
+        for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
+          const auto& old_occ = alpha_combs[old_id].occ;
+          const double a = minor_det_inplace(rot, old_occ, new_occ, alpha_sub, alpha_pivots);
+          if (std::abs(a) >= amp_cut) alpha_terms.push_back({old_id, a});
+        }
       }
-      const double a = it->second;
-      if (std::abs(a) >= amp_cut) alpha_terms.push_back({&occ.occ, a});
+
+      std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
+      std::vector<size_t> beta_pivots(wf.n_dn, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t new_id = 0; new_id < unique_dn_occs.size(); ++new_id) {
+        auto& beta_terms = beta_terms_by_new_occ[new_id];
+        beta_terms.reserve(beta_combs.size());
+        const auto& new_occ = *unique_dn_occs[new_id];
+        for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
+          const auto& old_occ = beta_combs[old_id].occ;
+          const double b = minor_det_inplace(rot, old_occ, new_occ, beta_sub, beta_pivots);
+          if (std::abs(b) >= amp_cut) beta_terms.push_back({old_id, b});
+        }
+      }
     }
 
-    std::vector<std::pair<const std::vector<unsigned>*, double>> beta_terms;
-    beta_terms.reserve(beta_combs.size());
-    for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
-      const auto& occ = beta_combs[old_id];
-      const MinorKey key{old_id, dn_occ_id};
-      auto it = beta_minor_cache.find(key);
-      if (it == beta_minor_cache.end()) {
-        const double value = minor_det_inplace(rot, occ.occ, e.dn_occ, beta_sub, beta_pivots);
-        it = beta_minor_cache.emplace(key, value).first;
-      }
-      const double b = it->second;
-      if (std::abs(b) >= amp_cut) beta_terms.push_back({&occ.occ, b});
-    }
+#pragma omp parallel if(use_parallel)
+    {
+#ifdef _OPENMP
+      auto& old_coef_map_local = old_coef_maps_local[omp_get_thread_num()];
+#else
+      auto& old_coef_map_local = old_coef_maps_local[0];
+#endif
 
-    for (const auto& a : alpha_terms) {
-      for (const auto& b : beta_terms) {
-        const double contrib = e.coef * a.second * b.second;
-        if (std::abs(contrib) < amp_cut) continue;
-        old_coef_map[{*a.first, *b.first}] += contrib;
+#pragma omp for schedule(dynamic)
+      for (size_t i = 0; i < ci_new.size(); ++i) {
+        const auto& e = ci_new[i];
+        const auto& alpha_terms = alpha_terms_by_new_occ[ci_up_ids[i]];
+        const auto& beta_terms = beta_terms_by_new_occ[ci_dn_ids[i]];
+
+        for (const auto& a : alpha_terms) {
+          for (const auto& b : beta_terms) {
+            const double contrib = e.coef * a.second * b.second;
+            if (std::abs(contrib) < amp_cut) continue;
+            old_coef_map_local[{alpha_combs[a.first].occ, beta_combs[b.first].occ}] += contrib;
+          }
+        }
       }
+    }
+  } else {
+#pragma omp parallel if(use_parallel)
+    {
+#ifdef _OPENMP
+      auto& old_coef_map_local = old_coef_maps_local[omp_get_thread_num()];
+#else
+      auto& old_coef_map_local = old_coef_maps_local[0];
+#endif
+
+      std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
+      std::vector<size_t> alpha_pivots(wf.n_up, 0);
+      std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
+      std::vector<size_t> beta_pivots(wf.n_dn, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t i = 0; i < ci_new.size(); ++i) {
+        const auto& e = ci_new[i];
+        std::vector<std::pair<size_t, double>> alpha_terms;
+        alpha_terms.reserve(alpha_combs.size());
+        for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
+          const auto& old_occ = alpha_combs[old_id].occ;
+          const double a = minor_det_inplace(rot, old_occ, e.up_occ, alpha_sub, alpha_pivots);
+          if (std::abs(a) >= amp_cut) alpha_terms.push_back({old_id, a});
+        }
+
+        std::vector<std::pair<size_t, double>> beta_terms;
+        beta_terms.reserve(beta_combs.size());
+        for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
+          const auto& old_occ = beta_combs[old_id].occ;
+          const double b = minor_det_inplace(rot, old_occ, e.dn_occ, beta_sub, beta_pivots);
+          if (std::abs(b) >= amp_cut) beta_terms.push_back({old_id, b});
+        }
+
+        for (const auto& a : alpha_terms) {
+          for (const auto& b : beta_terms) {
+            const double contrib = e.coef * a.second * b.second;
+            if (std::abs(contrib) < amp_cut) continue;
+            old_coef_map_local[{alpha_combs[a.first].occ, beta_combs[b.first].occ}] += contrib;
+          }
+        }
+      }
+    }
+  }
+
+  for (const auto& old_coef_map_local : old_coef_maps_local) {
+    for (const auto& kv : old_coef_map_local) {
+      old_coef_map[kv.first] += kv.second;
     }
   }
 
