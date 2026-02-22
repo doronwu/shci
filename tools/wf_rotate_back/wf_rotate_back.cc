@@ -10,7 +10,23 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#ifdef SHCI_USE_MPI
+#include <mpi.h>
+#endif
+
+#ifdef SHCI_USE_MPI
+class MpiGuard {
+ public:
+  MpiGuard(int* argc, char*** argv) { MPI_Init(argc, argv); }
+  ~MpiGuard() { MPI_Finalize(); }
+};
+#endif
 
 constexpr double SQRT2_INV = 0.7071067811865475;
 
@@ -87,22 +103,48 @@ struct DetKeyHash {
   }
 };
 
-struct MinorKey {
-  size_t old_id;
-  size_t new_id;
+static void merge_old_coef_maps(std::unordered_map<DetKey, double, DetKeyHash>& dst,
+                               const std::unordered_map<DetKey, double, DetKeyHash>& src) {
+  for (const auto& kv : src) dst[kv.first] += kv.second;
+}
 
-  bool operator==(const MinorKey& other) const {
-    return old_id == other.old_id && new_id == other.new_id;
+static std::string serialize_old_coef_map(const std::unordered_map<DetKey, double, DetKeyHash>& m) {
+  std::ostringstream os(std::ios::binary);
+  const uint64_t n = static_cast<uint64_t>(m.size());
+  os.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  for (const auto& kv : m) {
+    const uint64_t nu = static_cast<uint64_t>(kv.first.up.size());
+    const uint64_t nd = static_cast<uint64_t>(kv.first.dn.size());
+    os.write(reinterpret_cast<const char*>(&nu), sizeof(nu));
+    os.write(reinterpret_cast<const char*>(kv.first.up.data()), static_cast<std::streamsize>(nu * sizeof(unsigned)));
+    os.write(reinterpret_cast<const char*>(&nd), sizeof(nd));
+    os.write(reinterpret_cast<const char*>(kv.first.dn.data()), static_cast<std::streamsize>(nd * sizeof(unsigned)));
+    os.write(reinterpret_cast<const char*>(&kv.second), sizeof(kv.second));
   }
-};
+  return os.str();
+}
 
-struct MinorKeyHash {
-  size_t operator()(const MinorKey& key) const {
-    size_t seed = key.old_id;
-    seed ^= key.new_id + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    return seed;
+static void deserialize_into_old_coef_map(const char* data, size_t size,
+                                          std::unordered_map<DetKey, double, DetKeyHash>& out) {
+  std::string blob(data, size);
+  std::istringstream is(blob, std::ios::binary);
+  uint64_t n = 0;
+  is.read(reinterpret_cast<char*>(&n), sizeof(n));
+  for (uint64_t i = 0; i < n; ++i) {
+    uint64_t nu = 0;
+    uint64_t nd = 0;
+    DetKey key;
+    is.read(reinterpret_cast<char*>(&nu), sizeof(nu));
+    key.up.resize(static_cast<size_t>(nu));
+    is.read(reinterpret_cast<char*>(key.up.data()), static_cast<std::streamsize>(nu * sizeof(unsigned)));
+    is.read(reinterpret_cast<char*>(&nd), sizeof(nd));
+    key.dn.resize(static_cast<size_t>(nd));
+    is.read(reinterpret_cast<char*>(key.dn.data()), static_cast<std::streamsize>(nd * sizeof(unsigned)));
+    double coef = 0.0;
+    is.read(reinterpret_cast<char*>(&coef), sizeof(coef));
+    out[key] += coef;
   }
-};
+}
 
 static void usage() {
   std::cout << "Usage:\n"
@@ -231,6 +273,17 @@ static double minor_det_inplace(const std::vector<std::vector<double>>& rot,
 }
 
 int main(int argc, char* argv[]) {
+#ifdef SHCI_USE_MPI
+  MpiGuard mpi_guard(&argc, &argv);
+  int mpi_rank = 0;
+  int mpi_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+#else
+  const int mpi_rank = 0;
+  const int mpi_size = 1;
+#endif
+
   if (argc < 3) {
     usage();
     return 1;
@@ -319,66 +372,189 @@ int main(int argc, char* argv[]) {
   const auto alpha_combs = enumerate_combs(n_orb, wf.n_up);
   const auto beta_combs = enumerate_combs(n_orb, wf.n_dn);
 
-  std::unordered_map<DetKey, double, DetKeyHash> old_coef_map;
-  old_coef_map.reserve(alpha_combs.size() * 2);
-
   std::unordered_map<std::vector<unsigned>, size_t, VecHash> up_occ_id_map;
   std::unordered_map<std::vector<unsigned>, size_t, VecHash> dn_occ_id_map;
   up_occ_id_map.reserve(ci_new.size());
   dn_occ_id_map.reserve(ci_new.size());
 
-  std::unordered_map<MinorKey, double, MinorKeyHash> alpha_minor_cache;
-  std::unordered_map<MinorKey, double, MinorKeyHash> beta_minor_cache;
-  alpha_minor_cache.reserve(alpha_combs.size() * 4);
-  beta_minor_cache.reserve(beta_combs.size() * 4);
+  std::vector<size_t> ci_up_ids(ci_new.size(), 0);
+  std::vector<size_t> ci_dn_ids(ci_new.size(), 0);
+  std::vector<const std::vector<unsigned>*> unique_up_occs;
+  std::vector<const std::vector<unsigned>*> unique_dn_occs;
+  unique_up_occs.reserve(ci_new.size());
+  unique_dn_occs.reserve(ci_new.size());
 
-  std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
-  std::vector<size_t> alpha_pivots(wf.n_up, 0);
-  std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
-  std::vector<size_t> beta_pivots(wf.n_dn, 0);
+  for (size_t i = 0; i < ci_new.size(); ++i) {
+    const auto& e = ci_new[i];
+    const auto up_insert = up_occ_id_map.emplace(e.up_occ, unique_up_occs.size());
+    if (up_insert.second) unique_up_occs.push_back(&up_insert.first->first);
+    ci_up_ids[i] = up_insert.first->second;
 
-  for (const auto& e : ci_new) {
-    const auto up_insert = up_occ_id_map.emplace(e.up_occ, up_occ_id_map.size());
-    const size_t up_occ_id = up_insert.first->second;
-    const auto dn_insert = dn_occ_id_map.emplace(e.dn_occ, dn_occ_id_map.size());
-    const size_t dn_occ_id = dn_insert.first->second;
+    const auto dn_insert = dn_occ_id_map.emplace(e.dn_occ, unique_dn_occs.size());
+    if (dn_insert.second) unique_dn_occs.push_back(&dn_insert.first->first);
+    ci_dn_ids[i] = dn_insert.first->second;
+  }
 
-    std::vector<std::pair<const std::vector<unsigned>*, double>> alpha_terms;
-    alpha_terms.reserve(alpha_combs.size());
-    for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
-      const auto& occ = alpha_combs[old_id];
-      const MinorKey key{old_id, up_occ_id};
-      auto it = alpha_minor_cache.find(key);
-      if (it == alpha_minor_cache.end()) {
-        const double value = minor_det_inplace(rot, occ.occ, e.up_occ, alpha_sub, alpha_pivots);
-        it = alpha_minor_cache.emplace(key, value).first;
+  std::unordered_map<DetKey, double, DetKeyHash> old_coef_map;
+  old_coef_map.reserve(alpha_combs.size() * 2);
+
+  const bool use_parallel = ci_new.size() > 1;
+  const bool has_reuse = unique_up_occs.size() < ci_new.size() || unique_dn_occs.size() < ci_new.size();
+
+  int n_threads = 1;
+#ifdef _OPENMP
+  n_threads = use_parallel ? omp_get_max_threads() : 1;
+#endif
+  std::vector<std::unordered_map<DetKey, double, DetKeyHash>> old_coef_maps_local(n_threads);
+  for (auto& m : old_coef_maps_local) m.reserve(alpha_combs.size());
+
+  if (has_reuse) {
+    std::vector<std::vector<std::pair<size_t, double>>> alpha_terms_by_new_occ(unique_up_occs.size());
+    std::vector<std::vector<std::pair<size_t, double>>> beta_terms_by_new_occ(unique_dn_occs.size());
+
+#pragma omp parallel if(use_parallel)
+    {
+      std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
+      std::vector<size_t> alpha_pivots(wf.n_up, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t new_id = 0; new_id < unique_up_occs.size(); ++new_id) {
+        auto& alpha_terms = alpha_terms_by_new_occ[new_id];
+        alpha_terms.reserve(alpha_combs.size());
+        const auto& new_occ = *unique_up_occs[new_id];
+        for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
+          const auto& old_occ = alpha_combs[old_id].occ;
+          const double a = minor_det_inplace(rot, old_occ, new_occ, alpha_sub, alpha_pivots);
+          if (std::abs(a) >= amp_cut) alpha_terms.push_back({old_id, a});
+        }
       }
-      const double a = it->second;
-      if (std::abs(a) >= amp_cut) alpha_terms.push_back({&occ.occ, a});
+
+      std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
+      std::vector<size_t> beta_pivots(wf.n_dn, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t new_id = 0; new_id < unique_dn_occs.size(); ++new_id) {
+        auto& beta_terms = beta_terms_by_new_occ[new_id];
+        beta_terms.reserve(beta_combs.size());
+        const auto& new_occ = *unique_dn_occs[new_id];
+        for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
+          const auto& old_occ = beta_combs[old_id].occ;
+          const double b = minor_det_inplace(rot, old_occ, new_occ, beta_sub, beta_pivots);
+          if (std::abs(b) >= amp_cut) beta_terms.push_back({old_id, b});
+        }
+      }
     }
 
-    std::vector<std::pair<const std::vector<unsigned>*, double>> beta_terms;
-    beta_terms.reserve(beta_combs.size());
-    for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
-      const auto& occ = beta_combs[old_id];
-      const MinorKey key{old_id, dn_occ_id};
-      auto it = beta_minor_cache.find(key);
-      if (it == beta_minor_cache.end()) {
-        const double value = minor_det_inplace(rot, occ.occ, e.dn_occ, beta_sub, beta_pivots);
-        it = beta_minor_cache.emplace(key, value).first;
-      }
-      const double b = it->second;
-      if (std::abs(b) >= amp_cut) beta_terms.push_back({&occ.occ, b});
-    }
+#pragma omp parallel if(use_parallel)
+    {
+#ifdef _OPENMP
+      auto& old_coef_map_local = old_coef_maps_local[omp_get_thread_num()];
+#else
+      auto& old_coef_map_local = old_coef_maps_local[0];
+#endif
 
-    for (const auto& a : alpha_terms) {
-      for (const auto& b : beta_terms) {
-        const double contrib = e.coef * a.second * b.second;
-        if (std::abs(contrib) < amp_cut) continue;
-        old_coef_map[{*a.first, *b.first}] += contrib;
+#pragma omp for schedule(dynamic)
+      for (size_t i = static_cast<size_t>(mpi_rank); i < ci_new.size(); i += static_cast<size_t>(mpi_size)) {
+        const auto& e = ci_new[i];
+        const auto& alpha_terms = alpha_terms_by_new_occ[ci_up_ids[i]];
+        const auto& beta_terms = beta_terms_by_new_occ[ci_dn_ids[i]];
+
+        for (const auto& a : alpha_terms) {
+          for (const auto& b : beta_terms) {
+            const double contrib = e.coef * a.second * b.second;
+            if (std::abs(contrib) < amp_cut) continue;
+            old_coef_map_local[{alpha_combs[a.first].occ, beta_combs[b.first].occ}] += contrib;
+          }
+        }
+      }
+    }
+  } else {
+#pragma omp parallel if(use_parallel)
+    {
+#ifdef _OPENMP
+      auto& old_coef_map_local = old_coef_maps_local[omp_get_thread_num()];
+#else
+      auto& old_coef_map_local = old_coef_maps_local[0];
+#endif
+
+      std::vector<double> alpha_sub(static_cast<size_t>(wf.n_up) * wf.n_up, 0.0);
+      std::vector<size_t> alpha_pivots(wf.n_up, 0);
+      std::vector<double> beta_sub(static_cast<size_t>(wf.n_dn) * wf.n_dn, 0.0);
+      std::vector<size_t> beta_pivots(wf.n_dn, 0);
+
+#pragma omp for schedule(dynamic)
+      for (size_t i = static_cast<size_t>(mpi_rank); i < ci_new.size(); i += static_cast<size_t>(mpi_size)) {
+        const auto& e = ci_new[i];
+        std::vector<std::pair<size_t, double>> alpha_terms;
+        alpha_terms.reserve(alpha_combs.size());
+        for (size_t old_id = 0; old_id < alpha_combs.size(); ++old_id) {
+          const auto& old_occ = alpha_combs[old_id].occ;
+          const double a = minor_det_inplace(rot, old_occ, e.up_occ, alpha_sub, alpha_pivots);
+          if (std::abs(a) >= amp_cut) alpha_terms.push_back({old_id, a});
+        }
+
+        std::vector<std::pair<size_t, double>> beta_terms;
+        beta_terms.reserve(beta_combs.size());
+        for (size_t old_id = 0; old_id < beta_combs.size(); ++old_id) {
+          const auto& old_occ = beta_combs[old_id].occ;
+          const double b = minor_det_inplace(rot, old_occ, e.dn_occ, beta_sub, beta_pivots);
+          if (std::abs(b) >= amp_cut) beta_terms.push_back({old_id, b});
+        }
+
+        for (const auto& a : alpha_terms) {
+          for (const auto& b : beta_terms) {
+            const double contrib = e.coef * a.second * b.second;
+            if (std::abs(contrib) < amp_cut) continue;
+            old_coef_map_local[{alpha_combs[a.first].occ, beta_combs[b.first].occ}] += contrib;
+          }
+        }
       }
     }
   }
+
+  for (const auto& old_coef_map_local : old_coef_maps_local) {
+    merge_old_coef_maps(old_coef_map, old_coef_map_local);
+  }
+
+#ifdef SHCI_USE_MPI
+  if (mpi_size > 1) {
+    const std::string payload = serialize_old_coef_map(old_coef_map);
+    const int local_size = static_cast<int>(payload.size());
+    std::vector<int> recv_sizes;
+    if (mpi_rank == 0) recv_sizes.resize(mpi_size, 0);
+    int* recv_sizes_ptr = mpi_rank == 0 ? recv_sizes.data() : nullptr;
+    MPI_Gather(&local_size, 1, MPI_INT, recv_sizes_ptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<int> displs;
+    std::vector<char> recv_buf;
+    if (mpi_rank == 0) {
+      displs.resize(mpi_size, 0);
+      int total = 0;
+      for (int r = 0; r < mpi_size; ++r) {
+        displs[r] = total;
+        total += recv_sizes[r];
+      }
+      recv_buf.resize(total);
+    }
+
+    char* recv_buf_ptr = mpi_rank == 0 ? recv_buf.data() : nullptr;
+    int* displs_ptr = mpi_rank == 0 ? displs.data() : nullptr;
+    MPI_Gatherv(payload.data(), local_size, MPI_CHAR,
+                recv_buf_ptr, recv_sizes_ptr, displs_ptr, MPI_CHAR,
+                0, MPI_COMM_WORLD);
+
+    if (mpi_rank == 0) {
+      std::unordered_map<DetKey, double, DetKeyHash> merged;
+      merged.reserve(old_coef_map.size() * static_cast<size_t>(mpi_size));
+      for (int r = 0; r < mpi_size; ++r) {
+        deserialize_into_old_coef_map(recv_buf.data() + displs[r], static_cast<size_t>(recv_sizes[r]), merged);
+      }
+      old_coef_map.swap(merged);
+    } else {
+      old_coef_map.clear();
+    }
+  }
+#endif
 
   std::vector<CIEntry> ci_old;
   ci_old.reserve(old_coef_map.size());
@@ -390,7 +566,7 @@ int main(int argc, char* argv[]) {
     return std::abs(a.coef) > std::abs(b.coef);
   });
 
-  {
+  if (mpi_rank == 0) {
     std::ofstream out(out_prefix + "_new_basis.tsv");
     out << "# up_occ(1-based)\tdn_occ(1-based)\tcoef\n";
     out << std::setprecision(16);
@@ -402,7 +578,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  {
+  if (mpi_rank == 0) {
     std::ofstream out(out_prefix + "_old_basis.tsv");
     out << "# up_occ(1-based)\tdn_occ(1-based)\tcoef\n";
     out << std::setprecision(16);
@@ -414,9 +590,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  std::cout << "Loaded wf: n_dets=" << wf.get_n_dets() << ", n_states=" << wf.coefs.size() << "\n";
-  std::cout << "Using state=" << i_state << ", selected new-basis CI count=" << ci_new.size() << "\n";
-  std::cout << "Generated old-basis CI count=" << ci_old.size() << "\n";
-  std::cout << "Output: " << out_prefix << "_new_basis.tsv and " << out_prefix << "_old_basis.tsv\n";
+  if (mpi_rank == 0) {
+    std::cout << "Loaded wf: n_dets=" << wf.get_n_dets() << ", n_states=" << wf.coefs.size() << "\n";
+    std::cout << "Using state=" << i_state << ", selected new-basis CI count=" << ci_new.size() << "\n";
+    std::cout << "Generated old-basis CI count=" << ci_old.size() << "\n";
+    std::cout << "Output: " << out_prefix << "_new_basis.tsv and " << out_prefix << "_old_basis.tsv\n";
+  }
   return 0;
 }
