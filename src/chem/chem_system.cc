@@ -629,8 +629,21 @@ void ChemSystem::post_variation(std::vector<std::vector<size_t>>& connections) {
       unpack_time_sym();
       unpacked = true;
     }
-    const double s2 = get_s2(coefs[0]);
-    Result::put("s2", s2);
+    for (unsigned i_state = 0; i_state < n_states; i_state++) {
+      const std::string state_suffix = i_state == 0 ? "" : "_" + std::to_string(i_state);
+      const double s2 = get_s2(coefs[i_state]);
+      Result::put(Util::str_printf("s2%s", state_suffix.c_str()), s2);
+    }
+  }
+}
+
+void ChemSystem::save_variation_observables(const double eps_var) {
+  if (!Config::get<bool>("s2", false)) return;
+  if (time_sym) return;
+  for (unsigned i_state = 0; i_state < n_states; i_state++) {
+    const std::string state_suffix = i_state == 0 ? "" : "_" + std::to_string(i_state);
+    const double s2 = get_s2(coefs[i_state]);
+    Result::put(Util::str_printf("s2%s/%#.2e", state_suffix.c_str(), eps_var), s2);
   }
 }
 

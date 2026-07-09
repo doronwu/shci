@@ -369,6 +369,7 @@ void Solver<S>::run_all_variations() {
             Util::str_printf("energy_var%s/%#.2e", get_state_suffix(i_state).c_str(), eps_var),
             system.energy_var[i_state]);
       }
+      system.save_variation_observables(eps_var);
       Timer::end();
       save_variation_result(filename);
     } else {
@@ -381,6 +382,7 @@ void Solver<S>::run_all_variations() {
             Util::str_printf("energy_var%s/%#.2e", get_state_suffix(i_state).c_str(), eps_var),
             system.energy_var[i_state]);
       }
+      system.save_variation_observables(eps_var);
     }
 
     if (Parallel::is_master() && get_pair_contrib) {
@@ -1381,7 +1383,7 @@ void Solver<S>::print_dets_info() const {
     }
     printf("----------------------------------------\n");
     printf("%-10s%12s%16s\n", "Orbital", "", "Sum c^2");
-    for (unsigned j = 0; j < system.n_orbs && j < 50; j++) {
+    for (unsigned j = 0; j < system.n_orbs; j++) {
       printf("%-10u%12s%16.8f\n", j, "", orb_occupations[j]);
     }
     double sum_orb_occupation = std::accumulate(orb_occupations.begin(), orb_occupations.end(), 0.0);

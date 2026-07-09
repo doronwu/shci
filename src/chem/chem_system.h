@@ -29,6 +29,8 @@ class ChemSystem : public BaseSystem {
 
   void post_variation(std::vector<std::vector<size_t>>& connections) override;
 
+  void save_variation_observables(const double eps_var) override;
+
   void post_variation_optimization(
       SparseMatrix& hamiltonian_matrix,
       const std::string& method) override;
