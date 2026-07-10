@@ -73,6 +73,8 @@ class BaseSystem {
 
   virtual void post_variation(std::vector<std::vector<size_t>>&){};
 
+  virtual void save_variation_observables(const double){};
+
   virtual void post_variation_optimization(
       SparseMatrix&, const std::string&) {};
 
