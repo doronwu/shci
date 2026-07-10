@@ -22,7 +22,7 @@ void ChemSystem::setup(const bool load_integrals_from_file) {
     n_elecs = n_up + n_dn;
     Result::put("n_elecs", n_elecs);
     n_states = Config::get<unsigned>("n_states", 1);
-  
+
     point_group = get_point_group(Config::get<std::string>("chem/point_group"));
     product_table.set_point_group(point_group);
     time_sym = Config::get<bool>("time_sym", false);
@@ -254,7 +254,7 @@ double ChemSystem::get_singles_queue_elem(const unsigned orb_i, const unsigned o
   for (unsigned i = 0; i < std::min(n_elecs - 1, 2*n_orbs-2); i++) {
     S_min += singles_queue_elems[i];
     S_max += singles_queue_elems[2*n_orbs-3-i];
-  } 
+  }
   return std::max(std::abs(S_min), std::abs(S_max));
 }
 
@@ -629,8 +629,13 @@ void ChemSystem::post_variation(std::vector<std::vector<size_t>>& connections) {
       unpack_time_sym();
       unpacked = true;
     }
-    const double s2 = get_s2(coefs[0]);
-    Result::put("s2", s2);
+    for (unsigned i_state = 0; i_state < n_states; i_state++) {
+      const double s2 = get_s2(coefs[i_state]);
+      const auto& value_entry = Util::str_printf(
+                                                 "s2_%d",i_state);
+
+      Result::put(value_entry, s2);
+    }
   }
 }
 
@@ -671,8 +676,8 @@ void ChemSystem::post_variation_optimization(
       optorb_optimizer.get_optorb_rotation_matrix_from_approximate_newton();
     }
     Timer::end();
-   
-    hamiltonian_matrix.clear(); 
+
+    hamiltonian_matrix.clear();
     variation_cleanup();
 
     rotation_matrix *= optorb_optimizer.rotation_matrix();

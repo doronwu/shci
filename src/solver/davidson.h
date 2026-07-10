@@ -16,6 +16,12 @@ class Davidson {
       const double target_error,
       const bool verbose = false);
 
+  void diagonalize2(
+                   const SparseMatrix& matrix,
+                   const std::vector<std::vector<double>>& initial_vectors,
+                   const double target_error,
+                   const bool verbose = false);
+
   std::vector<double> get_lowest_eigenvalues() const { return lowest_eigenvalues; }
 
   std::vector<std::vector<double>> get_lowest_eigenvectors() const { return lowest_eigenvectors; }

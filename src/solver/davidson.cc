@@ -5,7 +5,166 @@
 #include "../config.h"
 #include <random>
 
-void Davidson::diagonalize(
+
+/* ------------------------------------------------------------
+   Helper: double Gram–Schmidt and norm check
+   Adds vec to basis (v, Hv) if it survives orthonormalisation.
+   Returns true  if the vector was accepted, false otherwise.
+   ------------------------------------------------------------ */
+static bool push_new_vector(std::vector<double>& vec,
+                            const SparseMatrix&  H,
+                            std::vector<std::vector<double>>& v,
+                            std::vector<std::vector<double>>& Hv,
+                            double lindep)
+{
+    const size_t dim = vec.size();
+    /* two GS passes ------------------------------------------------ */
+    for (int pass = 0; pass < 2; ++pass)
+        for (size_t i = 0; i < v.size(); ++i) {
+            double s = Util::dot_omp(vec, v[i]);
+            #pragma omp parallel for
+            for (size_t j = 0; j < dim; ++j) vec[j] -= s * v[i][j];
+        }
+
+    double nrm = std::sqrt(Util::dot_omp(vec, vec));
+    if (nrm < lindep) return false;               // too small, reject
+
+    #pragma omp parallel for
+    for (size_t j = 0; j < dim; ++j) vec[j] /= nrm;
+
+    /* store -------------------------------------------------------- */
+    v.push_back(vec);
+    Hv.push_back(H.mul(vec));
+    return true;
+}
+
+/* ===================================================================
+   Davidson::diagonalize  (block version with items 1‑3)
+   =================================================================== */
+void Davidson::diagonalize(const SparseMatrix&                       H,
+                           const std::vector<std::vector<double>>&   initial_vectors,
+                           double  tol_e,           /* 1e‑12 or tighter */
+                           bool    verbose)
+{
+    const double tol_r = std::sqrt(tol_e);         // residual tolerance
+    const double lindep = 1e-12;                   // drop threshold
+    const std::size_t max_cycle = 50;
+
+    /* -------- basic dimensions ----------------------------------- */
+    const std::size_t dim       = initial_vectors[0].size();
+    const std::size_t n_states  = std::min(dim, initial_vectors.size());
+
+    /* -------- storage for Krylov basis and Ritz data ------------- */
+    std::vector<std::vector<double>> v;            // basis vectors
+    std::vector<std::vector<double>> Hv;           // H|v_i⟩
+    v.reserve(64);  Hv.reserve(64);
+
+    std::vector<std::vector<double>> w(n_states, std::vector<double>(dim));
+    std::vector<std::vector<double>> Hw(n_states, std::vector<double>(dim));
+
+    std::vector<double> evals(n_states, 0.0), evals_prev(n_states, 1e100);
+    std::vector<double> resid_norm(n_states, 1e100);
+    std::vector<char>   root_converged(n_states, 0);
+
+    /* -------- pre‑compute diagonal for Jacobi preconditioner ----- */
+    std::vector<double> diag(dim);
+    for (std::size_t i = 0; i < dim; ++i) diag[i] = H.get_diag(i);
+
+    /* -------- 0. start with orthonormalised user guesses --------- */
+    for (std::size_t k = 0; k < n_states; ++k) {
+        std::vector<double> g = initial_vectors[k];                 // copy
+        push_new_vector(g, H, v, Hv, lindep);
+    }
+
+    /* -------- main Davidson loop --------------------------------- */
+    std::size_t iter = 0;
+    while (iter++ < max_cycle) {
+
+        const std::size_t m = v.size();                             // basis size
+        /* 1. build projected Hamiltonian -------------------------- */
+        Eigen::MatrixXd Hm = Eigen::MatrixXd::Zero(m, m);
+        for (std::size_t i = 0; i < m; ++i)
+            for (std::size_t j = 0; j <= i; ++j) {                  // lower tri
+                double hij = Util::dot_omp(v[i], Hv[j]);
+                Hm(i,j) = Hm(j,i) = hij;
+            }
+
+        /* 2. diagonalise projected H ------------------------------ */
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Hm);
+        const Eigen::VectorXd& lam = es.eigenvalues();
+        const Eigen::MatrixXd& U   = es.eigenvectors();
+
+        /* 3. back‑transform first n_states Ritz pairs ------------- */
+        #pragma omp parallel for
+        for (std::size_t k = 0; k < n_states; ++k) {
+            evals[k] = lam(k);
+            std::fill(w[k].begin(),  w[k].end(),  0.0);
+            std::fill(Hw[k].begin(), Hw[k].end(), 0.0);
+
+            for (std::size_t i = 0; i < m; ++i) {
+                double c = U(i, k);
+                const auto& vi  = v[i];
+                const auto& Hvi = Hv[i];
+                for (std::size_t j = 0; j < dim; ++j) {
+                    w[k][j]  += c * vi [j];
+                    Hw[k][j] += c * Hvi[j];
+                }
+            }
+        }
+
+        /* 4. residuals, convergence test, and new directions ------ */
+        bool all_conv = true;
+        for (std::size_t k = 0; k < n_states; ++k) {
+            if (root_converged[k]) continue;
+
+            /* residual r = H|w〉 – e|w〉 --------------------------- */
+            std::vector<double> r(dim);
+            #pragma omp parallel for
+            for (std::size_t j = 0; j < dim; ++j)
+                r[j] = Hw[k][j] - evals[k] * w[k][j];
+
+            resid_norm[k] = std::sqrt(Util::dot_omp(r, r));
+
+            bool conv_now =
+                  (std::fabs(evals[k] - evals_prev[k]) < tol_e) &&
+                  (resid_norm[k] < tol_r);
+
+            root_converged[k] = conv_now;
+            all_conv &= conv_now;
+
+            if (!conv_now) {
+                /* 5. Jacobi‑Davidson pre‑conditioning ------------- */
+                #pragma omp parallel for
+                for (std::size_t j = 0; j < dim; ++j) {
+                    double denom = evals[k] - diag[j];
+                    if (std::fabs(denom) < 1e-4)
+                        denom = (denom >= 0 ? 1 : -1) * 1e-4;        // level‑shift
+                    r[j] /= denom;
+                }
+                push_new_vector(r, H, v, Hv, lindep);               // may be rejected
+            }
+        }
+
+        if (verbose) {
+            std::printf("Dav %2zu :", iter);
+            for (double e : evals) std::printf(" % .10f", e);
+            std::printf("\n");
+        }
+
+        if (all_conv) break;
+        evals_prev = evals;                                         // for Δe test:
+    }
+
+    /* -------- copy results out ---------------------------------- */
+    lowest_eigenvalues  = evals;
+    lowest_eigenvectors = w;
+    converged           = std::all_of(root_converged.begin(),
+                                      root_converged.end(),
+                                      [](char c){ return c; });
+}
+
+
+void Davidson::diagonalize2(
     const SparseMatrix& matrix,
     const std::vector<std::vector<double>>& initial_vectors,
     const double target_error,
